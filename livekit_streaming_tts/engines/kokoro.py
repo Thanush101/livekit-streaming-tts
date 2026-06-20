@@ -30,6 +30,7 @@ class KokoroEngine(TTSEngine):
         default_voice: str = "af_heart",
         device: Optional[str] = None,
         lang_code: str = "a",  # 'a' = American English, 'b' = British, 'j' = Japanese...
+        prewarm_voices: Optional[list[str]] = None,
     ) -> None:
         from kokoro import KPipeline
 
@@ -40,6 +41,29 @@ class KokoroEngine(TTSEngine):
         )
         self._default_voice = default_voice
         self._lang_code = lang_code
+
+        # Pre-warm voice tensors at startup so the first user turn doesn't pay
+        # the HuggingFace download (~3s for af_heart.pt). Override via env:
+        # KOKORO_PREWARM=af_heart,am_michael tts-server ...
+        import os as _os
+        env_warm = _os.getenv("KOKORO_PREWARM", "")
+        warm_list = (
+            prewarm_voices
+            if prewarm_voices is not None
+            else (
+                [v.strip() for v in env_warm.split(",") if v.strip()]
+                or [default_voice]
+            )
+        )
+        for v in warm_list:
+            try:
+                # KPipeline.load_voice fetches the .pt file from HF and caches
+                # it in memory. After this the first generate() is hot.
+                self._pipeline.load_voice(v)
+            except Exception:
+                # Pre-warm is best-effort. If a name isn't in this language's
+                # catalog, the user can still pass it at generate time.
+                pass
 
     def list_voices(self) -> list[str]:
         # Kokoro has a fixed catalog; the most common are exposed below.

@@ -43,6 +43,7 @@ from typing import Optional
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
+from ._paths import data_dir
 from .audio import encode
 from .base import GenerationParams, TTSEngine
 from .normalize import is_speakable, normalize_text, split_sentences
@@ -195,7 +196,24 @@ class GPUWorker:
 # FastAPI surface
 # --------------------------------------------------------------------------
 
-VOICES_DIR = os.getenv("TTS_VOICES_DIR", "/var/lib/livekit-streaming-tts/voices")
+VOICES_DIR = data_dir("voices", env_var="TTS_VOICES_DIR")
+
+
+# Module-level so FastAPI's OpenAPI schema generator can resolve forward refs
+# when /docs hits /openapi.json. Defining it inside create_app() works at
+# runtime but breaks Pydantic v2's TypeAdapter resolution.
+class TTSRequest(BaseModel):
+    text: str
+    voice: Optional[str] = None
+    ref_audio: Optional[str] = None
+    ref_text: Optional[str] = None
+    language: Optional[str] = None
+    speed: Optional[float] = None
+    seed: Optional[int] = None
+    sample_rate: Optional[int] = None
+    normalize: bool = True
+    format: str = "wav"  # "wav" or "pcm"
+    extra: dict = {}
 
 
 def create_app(
@@ -270,6 +288,7 @@ def create_app(
         return {
             "status": "ok",
             "engine": w.engine.name,
+            "native_sample_rate": w.engine.native_sample_rate,
             "capabilities": w.engine.capabilities.__dict__,
             "queue_size": w.queue_size,
             "active_connections": w.active_connections,
@@ -329,19 +348,6 @@ def create_app(
         return {"deleted": voice_id}
 
     # ---- One-shot HTTP TTS --------------------------------------------
-
-    class TTSRequest(BaseModel):
-        text: str
-        voice: Optional[str] = None
-        ref_audio: Optional[str] = None
-        ref_text: Optional[str] = None
-        language: Optional[str] = None
-        speed: Optional[float] = None
-        seed: Optional[int] = None
-        sample_rate: Optional[int] = None
-        normalize: bool = True
-        format: str = "wav"  # "wav" or "pcm"
-        extra: dict = {}
 
     @app.post("/v1/tts")
     async def http_tts(req: TTSRequest):

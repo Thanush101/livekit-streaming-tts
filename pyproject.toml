@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "livekit-streaming-tts"
-version = "0.1.0"
+version = "0.1.1"
 description = "Engine-agnostic, low-latency TTS plugin for LiveKit agents. Pluggable backends: OmniVoice, Pocket TTS, Kokoro, KittenTTS, XTTS, Piper, Bark."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -38,7 +38,7 @@ hq-resample = ["soxr>=0.3"]
 
 # Engines — install only the ones you use.
 omnivoice = ["torch>=2.1", "soundfile>=0.12"]
-pocket    = ["torch>=2.1"]
+pocket    = ["pocket-tts>=2.0", "torch>=2.1"]
 kokoro    = ["kokoro>=0.7", "torch>=2.1"]
 kitten    = ["kittentts>=0.1"]
 xtts      = ["TTS>=0.22", "torch>=2.1"]
@@ -49,6 +49,7 @@ bark      = ["bark>=0.1", "torch>=2.1"]
 # conflicting torch/numpy versions).
 all = [
     "torch>=2.1", "soundfile>=0.12",
+    "pocket-tts>=2.0",
     "kokoro>=0.7", "kittentts>=0.1",
     "TTS>=0.22", "piper-tts>=1.2",
     "bark>=0.1", "soxr>=0.3",
@@ -64,6 +65,9 @@ dev = [
 Homepage      = "https://github.com/Thanush101/livekit-streaming-tts"
 Issues        = "https://github.com/Thanush101/livekit-streaming-tts/issues"
 Documentation = "https://github.com/Thanush101/livekit-streaming-tts#readme"
+
+[project.scripts]
+tts-server = "livekit_streaming_tts.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["livekit_streaming_tts*"]
