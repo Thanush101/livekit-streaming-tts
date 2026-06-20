@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "livekit-streaming-tts"
+version = "0.1.0"
+description = "Engine-agnostic, low-latency TTS plugin for LiveKit agents. Pluggable backends: OmniVoice, Pocket TTS, Kokoro, KittenTTS, XTTS, Piper, Bark."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Thanush" }]
+keywords = ["livekit", "tts", "voice", "streaming", "websocket", "speech-synthesis"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+dependencies = [
+    "numpy>=1.24",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "aiohttp>=3.9",
+    "pydantic>=2.0",
+    "inflect>=7.0",
+    "livekit-agents>=0.10",
+    "python-multipart>=0.0.6",
+]
+
+[project.optional-dependencies]
+# Quality resampler (recommended for telephony 8kHz output)
+hq-resample = ["soxr>=0.3"]
+
+# Engines — install only the ones you use.
+omnivoice = ["torch>=2.1", "soundfile>=0.12"]
+pocket    = ["torch>=2.1"]
+kokoro    = ["kokoro>=0.7", "torch>=2.1"]
+kitten    = ["kittentts>=0.1"]
+xtts      = ["TTS>=0.22", "torch>=2.1"]
+piper     = ["piper-tts>=1.2"]
+bark      = ["bark>=0.1", "torch>=2.1"]
+
+# Convenience: everything (you almost never want this — engines pull
+# conflicting torch/numpy versions).
+all = [
+    "torch>=2.1", "soundfile>=0.12",
+    "kokoro>=0.7", "kittentts>=0.1",
+    "TTS>=0.22", "piper-tts>=1.2",
+    "bark>=0.1", "soxr>=0.3",
+]
+
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.4",
+]
+
+[project.urls]
+Homepage      = "https://github.com/Thanush101/livekit-streaming-tts"
+Issues        = "https://github.com/Thanush101/livekit-streaming-tts/issues"
+Documentation = "https://github.com/Thanush101/livekit-streaming-tts#readme"
+
+[tool.setuptools.packages.find]
+include = ["livekit_streaming_tts*"]
+exclude = ["examples*", "tests*"]
