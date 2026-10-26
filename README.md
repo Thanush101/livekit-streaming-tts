@@ -124,6 +124,24 @@ curl http://localhost:8001/health
 # {"status":"ok","engine":"pocket","capabilities":{...},"voices":[...]}
 ```
 
+## API key
+
+`TTS_API_KEY` is optional. Leave it unset, or set it to an empty string, and every route stays open. That is the local-dev behavior.
+
+Set it on the machine that runs `tts-server` when the server is reachable beyond localhost. `/health` stays open. `POST /v1/tts`, `GET /v1/voices`, `POST /v1/voices/upload`, `DELETE /v1/voices/{voice_id}`, and the `/tts/ws` handshake require the key.
+
+```bash
+TTS_API_KEY='choose-a-long-secret' tts-server --engine pocket --port 8001
+```
+
+Send that secret as `Authorization: Bearer <key>` or `X-API-Key: <key>`. A missing or wrong key is `401` JSON and no audio. The WebSocket upgrade is rejected with `401` before the socket is accepted. A key inside a later JSON message is ignored.
+
+```bash
+curl -H "Authorization: Bearer $TTS_API_KEY" http://localhost:8001/v1/voices
+```
+
+On the LiveKit machine, `livekit-plugins-pocket` sends `Authorization: Bearer ...` when `TTS(..., api_key=...)` or `POCKET_TTS_API_KEY` is set. `generate_audio.py` does the same when `TTS_API_KEY` or `POCKET_TTS_API_KEY` is set.
+
 ## Community models
 
 With no extra env, `tts-server --engine pocket` loads Kyutai's English Pocket TTS. That is the model in the table above.

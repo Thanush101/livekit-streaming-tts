@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hmac
 import io
 import json
 import logging
@@ -42,7 +43,8 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from ._paths import data_dir
@@ -234,6 +236,80 @@ def _as_bool(value: object, default: bool = False) -> bool:
     return default
 
 
+def _bearer_token(authorization: Optional[str]) -> Optional[str]:
+    """Token from ``Authorization: Bearer <key>``. Scheme compare is case-insensitive."""
+
+    if not isinstance(authorization, str) or authorization == "":
+        return None
+    parts = authorization.split(None, 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return None
+    token = parts[1].strip()
+    if token == "":
+        return None
+    return token
+
+
+def _presented_keys(authorization: Optional[str], x_api_key: Optional[str]) -> list[str]:
+    found: list[str] = []
+    if isinstance(x_api_key, str):
+        header_key = x_api_key.strip()
+        if header_key:
+            found.append(header_key)
+    bearer = _bearer_token(authorization)
+    if bearer is not None:
+        found.append(bearer)
+    return found
+
+
+def credentials_accepted(
+    expected: Optional[str],
+    authorization: Optional[str] = None,
+    x_api_key: Optional[str] = None,
+) -> bool:
+    """Whether this request may synthesize.
+
+    ``expected`` is the ``TTS_API_KEY`` value. ``None`` or ``""`` leaves the
+    server open, which is the local-dev behavior. Otherwise the client must
+    send ``Authorization: Bearer <key>`` or ``X-API-Key: <key>``. The compare
+    is :func:`hmac.compare_digest`. This does not read a key from a JSON body.
+    """
+
+    if expected is None or expected == "":
+        return True
+    presented = _presented_keys(authorization, x_api_key)
+    if not presented:
+        return False
+    # Always run compare_digest. A boolean ``or`` after it must not skip the call.
+    matched = False
+    for candidate in presented:
+        matched = hmac.compare_digest(candidate, expected) or matched
+    return matched
+
+
+def _require_api_key(headers) -> None:
+    """401 JSON when a key is configured and the headers do not carry it.
+
+    The header values are not logged.
+    """
+
+    if credentials_accepted(
+        os.environ.get("TTS_API_KEY"),
+        authorization=headers.get("authorization"),
+        x_api_key=headers.get("x-api-key"),
+    ):
+        return
+    raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+async def _reject_websocket(ws: WebSocket) -> None:
+    """Refuse the upgrade with 401. The socket is never accepted."""
+
+    await ws.send_denial_response(
+        JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    )
+
+
 def _plan_text(text: str, *, pauses: bool, normalize: bool, language: Optional[str]) -> list:
     """Spoken spans and silence seconds. Markers are split off before normalize."""
 
@@ -327,17 +403,20 @@ def create_app(
         }
 
     @app.get("/v1/voices")
-    async def list_voices_ep():
+    async def list_voices_ep(request: Request):
+        _require_api_key(request.headers)
         return {"voices": _worker().list_voices()}
 
     # ---- Voice management ---------------------------------------------
 
     @app.post("/v1/voices/upload")
     async def upload_voice(
+        request: Request,
         file: UploadFile = File(...),
         voice_id: str = Form("default"),
         ref_text: str = Form(""),
     ):
+        _require_api_key(request.headers)
         worker = _worker()
         if not worker.engine.capabilities.voice_cloning:
             raise HTTPException(
@@ -370,7 +449,8 @@ def create_app(
         return {"voice_id": voice_id}
 
     @app.delete("/v1/voices/{voice_id}")
-    async def delete_voice(voice_id: str):
+    async def delete_voice(voice_id: str, request: Request):
+        _require_api_key(request.headers)
         worker = _worker()
         worker.delete_voice(voice_id)
         meta = os.path.join(VOICES_DIR, f"{voice_id}.json")
@@ -381,7 +461,8 @@ def create_app(
     # ---- One-shot HTTP TTS --------------------------------------------
 
     @app.post("/v1/tts")
-    async def http_tts(req: TTSRequest):
+    async def http_tts(req: TTSRequest, request: Request):
+        _require_api_key(request.headers)
         worker = _worker()
         try:
             plan = _plan_text(
@@ -462,6 +543,16 @@ def create_app(
 
     @app.websocket("/tts/ws")
     async def tts_ws(ws: WebSocket):
+        # Reject before accept. A key inside a later JSON frame is not consulted,
+        # so a client cannot open the socket and then stall.
+        if not credentials_accepted(
+            os.environ.get("TTS_API_KEY"),
+            authorization=ws.headers.get("authorization"),
+            x_api_key=ws.headers.get("x-api-key"),
+        ):
+            await _reject_websocket(ws)
+            return
+
         if not state["ready"]:
             await ws.close(code=1013, reason="warming up")
             return
