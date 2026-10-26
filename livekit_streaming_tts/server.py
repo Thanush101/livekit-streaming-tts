@@ -30,10 +30,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import hmac
+import inspect
 import io
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 
@@ -68,6 +70,11 @@ class _Job:
     result_future: asyncio.Future = field(
         default_factory=lambda: asyncio.get_event_loop().create_future()
     )
+    # Set by a barge-in. Pocket's generate_audio_stream polls this.
+    stop: threading.Event = field(default_factory=threading.Event)
+    # When set, the worker pushes each AudioChunk here instead of one final blob.
+    stream_queue: Optional[asyncio.Queue] = None
+    loop: Optional[asyncio.AbstractEventLoop] = None
 
 
 class GPUWorker:
@@ -153,28 +160,38 @@ class GPUWorker:
         while True:
             try:
                 job = await self._queue.get()
-                if job.cancel_event.is_set():
-                    # Client interrupted before we got to it.
-                    job.result_future.set_result(None)
+                if job.cancel_event.is_set() or job.stop.is_set():
+                    # Client interrupted before we got to it. A streaming
+                    # waiter is blocked on the chunk queue, so close that too.
+                    if job.stream_queue is not None:
+                        self._finish_stream(job, result=None, count=False)
+                    elif not job.result_future.done():
+                        job.result_future.set_result(None)
                     self._queue.task_done()
                     continue
 
                 start = time.perf_counter()
                 try:
-                    audio = await loop.run_in_executor(
-                        None, self._generate_sync, job
-                    )
-                    elapsed = time.perf_counter() - start
-                    self._total_generated += 1
-                    logger.debug(
-                        "generated %.3fs of audio in %.3fs",
-                        len(audio.samples) / audio.sample_rate if audio else 0,
-                        elapsed,
-                    )
-                    job.result_future.set_result(audio)
+                    if job.stream_queue is not None:
+                        await loop.run_in_executor(None, self._stream_sync, job)
+                    else:
+                        audio = await loop.run_in_executor(
+                            None, self._generate_sync, job
+                        )
+                        elapsed = time.perf_counter() - start
+                        self._total_generated += 1
+                        logger.debug(
+                            "generated %.3fs of audio in %.3fs",
+                            len(audio.samples) / audio.sample_rate if audio else 0,
+                            elapsed,
+                        )
+                        job.result_future.set_result(audio)
                 except Exception as e:
                     logger.exception("generation failed")
-                    job.result_future.set_exception(e)
+                    if job.stream_queue is not None:
+                        self._finish_stream(job, error=e)
+                    elif not job.result_future.done():
+                        job.result_future.set_exception(e)
                 finally:
                     self._queue.task_done()
             except asyncio.CancelledError:
@@ -191,6 +208,99 @@ class GPUWorker:
         if job.params.voice and job.params.voice in self._voice_lru:
             self._voice_lru.move_to_end(job.params.voice)
         return self._engine.generate(job.params)
+
+    def _open_stream(self, job: _Job):
+        """Call generate_stream, passing ``stop`` only if that engine accepts it."""
+
+        fn = self._engine.generate_stream
+        try:
+            parameters = inspect.signature(fn).parameters
+        except (TypeError, ValueError):
+            parameters = {}
+        if "stop" in parameters:
+            return fn(job.params, stop=job.stop)
+        return fn(job.params)
+
+    def _finish_stream(
+        self,
+        job: _Job,
+        result=None,
+        error: Optional[BaseException] = None,
+        count: bool = True,
+    ) -> None:
+        """Sentinel, then the future. One loop callback so the consumer cannot miss either."""
+
+        loop = job.loop
+        queue = job.stream_queue
+        if loop is None or queue is None:
+            if error is not None and not job.result_future.done():
+                job.result_future.set_exception(error)
+            elif not job.result_future.done():
+                job.result_future.set_result(result)
+            return
+
+        def _apply() -> None:
+            queue.put_nowait(None)
+            if error is None and count:
+                self._total_generated += 1
+            if job.result_future.done():
+                return
+            if error is not None:
+                job.result_future.set_exception(error)
+            else:
+                job.result_future.set_result(result)
+
+        loop.call_soon_threadsafe(_apply)
+
+    def _stream_sync(self, job: _Job) -> None:
+        """Push each decoded chunk onto the asyncio queue, then a sentinel.
+
+        Runs on the worker thread. The event loop sends a chunk while this
+        thread is inside the next decode. Cancel stops enqueueing but keeps
+        pulling so the model iterator can join its decoder thread.
+        """
+
+        loop = job.loop
+        queue = job.stream_queue
+        if loop is None or queue is None:
+            self._finish_stream(job, error=RuntimeError("stream job has no queue"))
+            return
+        if job.cancel_event.is_set() or job.stop.is_set():
+            self._finish_stream(job, result=None)
+            return
+        if job.params.voice and job.params.voice in self._voice_lru:
+            self._voice_lru.move_to_end(job.params.voice)
+
+        try:
+            for chunk in self._open_stream(job):
+                cancelled = job.cancel_event.is_set() or job.stop.is_set()
+                if cancelled:
+                    job.stop.set()
+                    continue
+                loop.call_soon_threadsafe(queue.put_nowait, chunk)
+            self._finish_stream(job, result=None)
+        except Exception as exc:
+            logger.exception("generation failed")
+            self._finish_stream(job, error=exc)
+
+    async def iter_stream(self, job: _Job):
+        """Yield AudioChunks as the worker decodes them.
+
+        The first chunk is available before later chunks exist. Synthesis
+        errors raised by the engine propagate after the iterator ends.
+        """
+
+        job.loop = asyncio.get_running_loop()
+        job.stream_queue = asyncio.Queue()
+        await self._queue.put(job)
+        while True:
+            item = await job.stream_queue.get()
+            if item is None:
+                break
+            yield item
+        if not job.result_future.done():
+            await job.result_future
+        job.result_future.result()
 
     async def submit(self, job: _Job):
         await self._queue.put(job)
@@ -308,6 +418,37 @@ async def _reject_websocket(ws: WebSocket) -> None:
     await ws.send_denial_response(
         JSONResponse(status_code=401, content={"detail": "Unauthorized"})
     )
+
+
+def websocket_pcm_messages(
+    chunks: list[np.ndarray],
+    *,
+    sample_rate: int,
+    request_id: str,
+) -> list:
+    """int16 mono PCM for each chunk, in order, then the final event.
+
+    ``sample_rate`` is the model rate. Concatenating the PCM bytes equals
+    encoding the concatenated samples. Nothing is quantized and the first
+    sample of the first chunk is kept. The final event is last.
+    """
+
+    messages: list = []
+    for samples in chunks:
+        encoded, sr = encode(
+            np.asarray(samples, dtype=np.float32),
+            src_sample_rate=sample_rate,
+            target_sample_rate=sample_rate,
+            format="pcm",
+        )
+        if sr != sample_rate:
+            raise RuntimeError(f"streamed PCM left the model rate ({sr} != {sample_rate})")
+        messages.append(encoded)
+    messages.append({
+        "type": "event",
+        "data": {"event_type": "final", "request_id": request_id},
+    })
+    return messages
 
 
 def _plan_text(text: str, *, pauses: bool, normalize: bool, language: Optional[str]) -> list:
@@ -576,13 +717,21 @@ def create_app(
             "binary": False,      # if True + format=pcm, send PCM as binary frames
             "extra": {},
         }
-        text_buffer = ""
+        # One string cell so the reader can drop a cancelled tail without
+        # waiting for the handler to finish the sentence it is already in.
+        held = [""]
 
-        # Cancel signaling: each in-flight job gets the same cancel_event.
-        # When the client sends {"type":"cancel"}, we set it; the worker
-        # checks it before starting GPU work and any pending future returns
-        # None instead of audio.
-        cancel_event = asyncio.Event()
+        # Cancel signaling: each in-flight job receives the current events.
+        # The reader applies cancel as soon as the frame arrives, including
+        # while a sentence is still decoding. config and a finished flush
+        # replace both events so the next utterance on this socket is not silent.
+        class _Flags:
+            def __init__(self) -> None:
+                self.cancel = asyncio.Event()
+                self.stop = threading.Event()
+                self.epoch = 0
+
+        flags = _Flags()
 
         async def _send_audio(audio, sr_target: int):
             """Encode and send one audio chunk."""
@@ -609,7 +758,6 @@ def create_app(
                 }))
 
         async def _generate_and_send(text: str):
-            nonlocal cancel_event
             # Pause markers are split off before normalize. With pauses off,
             # the text is left as-is (still normalized when that flag is on)
             # and no silence is inserted.
@@ -629,7 +777,7 @@ def create_app(
 
             native = worker.engine.native_sample_rate
             for part in plan:
-                if cancel_event.is_set():
+                if flags.cancel.is_set() or flags.stop.is_set():
                     return
                 if isinstance(part, float):
                     samples = silence_samples(part, native)
@@ -650,24 +798,102 @@ def create_app(
                     sample_rate=config["sample_rate"],
                     extra=config["extra"],
                 )
-                job = _Job(params=params, cancel_event=cancel_event)
+                # Snapshot the events this sentence should observe. config
+                # replaces them only after this sentence returns.
+                job = _Job(
+                    params=params,
+                    cancel_event=flags.cancel,
+                    stop=flags.stop,
+                )
                 try:
-                    audio = await worker.submit(job)
+                    # Each decoded chunk is sent before the next one exists.
+                    # POST /v1/tts still uses submit() and returns one body.
+                    async for audio in worker.iter_stream(job):
+                        if flags.cancel.is_set() or flags.stop.is_set():
+                            return
+                        await _send_audio(audio, config["sample_rate"])
                 except asyncio.QueueFull:
                     await ws.send_text(json.dumps({
                         "type": "error",
                         "data": {"message": "queue full", "code": "queue_full"},
                     }))
                     return
-                await _send_audio(audio, config["sample_rate"])
 
+        inbox: asyncio.Queue = asyncio.Queue()
+
+        async def _read_client() -> None:
+            """Read the socket even while a sentence is decoding.
+
+            The handler used to own receive_text, so a cancel frame sat unread
+            until the current sentence finished and the only way to stop the
+            worker was to close the socket. The reader applies cancel to the
+            live events immediately. Text and flush keep the epoch they were
+            read under, and the handler ignores them once cancel has moved on.
+            """
+
+            try:
+                while True:
+                    raw = await ws.receive_text()
+                    try:
+                        msg = json.loads(raw)
+                    except json.JSONDecodeError as exc:
+                        await inbox.put(("bad_json", exc, flags.epoch))
+                        return
+                    if isinstance(msg, dict) and msg.get("type") == "cancel":
+                        flags.cancel.set()
+                        flags.stop.set()
+                        held[0] = ""
+                        flags.epoch += 1
+                    await inbox.put(("message", msg, flags.epoch))
+            except WebSocketDisconnect:
+                flags.cancel.set()
+                flags.stop.set()
+                await inbox.put(("disconnect", None, flags.epoch))
+            except Exception as exc:
+                flags.cancel.set()
+                flags.stop.set()
+                await inbox.put(("reader_failed", exc, flags.epoch))
+
+        reader = asyncio.create_task(_read_client())
         try:
             while True:
-                raw = await ws.receive_text()
-                msg = json.loads(raw)
-                msg_type = msg.get("type")
+                kind, payload, epoch = await inbox.get()
+                if kind == "disconnect":
+                    logger.info("[%s] disconnected", request_id)
+                    break
+                if kind == "bad_json":
+                    try:
+                        await ws.send_text(json.dumps({
+                            "type": "error",
+                            "data": {"message": f"invalid JSON: {payload}", "code": "parse_error"},
+                        }))
+                    except Exception:
+                        pass
+                    break
+                if kind == "reader_failed":
+                    logger.error(
+                        "[%s] websocket reader failed: %s",
+                        request_id,
+                        type(payload).__name__,
+                    )
+                    try:
+                        await ws.send_text(json.dumps({
+                            "type": "error",
+                            "data": {"message": str(payload), "code": "internal_error"},
+                        }))
+                    except Exception:
+                        pass
+                    break
+
+                msg = payload
+                msg_type = msg.get("type") if isinstance(msg, dict) else None
+                stale = epoch != flags.epoch
 
                 if msg_type == "config":
+                    # Start of a turn. A previous cancel must not apply to it,
+                    # including when a client reuses this socket.
+                    flags.cancel = asyncio.Event()
+                    flags.stop = threading.Event()
                     data = msg.get("data", {})
                     if not isinstance(data, dict):
                         data = {}
@@ -689,34 +915,54 @@ def create_app(
                     }))
 
                 elif msg_type == "text":
-                    text_buffer += msg.get("data", {}).get("text", "")
-                    sentences = split_sentences(text_buffer)
+                    if stale or flags.cancel.is_set():
+                        continue
+                    piece = msg.get("data", {})
+                    extra = piece.get("text", "") if isinstance(piece, dict) else ""
+                    held[0] += extra if isinstance(extra, str) else ""
+                    sentences = split_sentences(held[0])
                     if len(sentences) > 1:
                         # Dispatch all complete sentences immediately; keep
                         # the (possibly incomplete) tail.
+                        interrupted = False
                         for s in sentences[:-1]:
                             await _generate_and_send(s)
-                            if cancel_event.is_set():
+                            if flags.cancel.is_set() or epoch != flags.epoch:
+                                interrupted = True
                                 break
-                        text_buffer = sentences[-1]
+                        held[0] = "" if interrupted else sentences[-1]
 
                 elif msg_type == "flush":
-                    if is_speakable(text_buffer):
-                        await _generate_and_send(text_buffer)
-                    text_buffer = ""
+                    if stale or flags.cancel.is_set():
+                        held[0] = ""
+                        continue
+                    spoken = held[0]
+                    held[0] = ""
+                    if is_speakable(spoken):
+                        await _generate_and_send(spoken)
+                    # Cancel during this flush belongs to this utterance.
+                    # Do not emit final, and do not clear the flag the reader
+                    # just set. The next config replaces it.
+                    if flags.cancel.is_set() or epoch != flags.epoch:
+                        held[0] = ""
+                        continue
                     await ws.send_text(json.dumps({
                         "type": "event",
                         "data": {"event_type": "final", "request_id": request_id},
                     }))
-                    # Reset cancel_event for the next utterance — a single WS
-                    # session can carry many turns.
-                    cancel_event = asyncio.Event()
+                    if flags.cancel.is_set() or epoch != flags.epoch:
+                        continue
+                    flags.cancel = asyncio.Event()
+                    flags.stop = threading.Event()
 
                 elif msg_type == "cancel":
-                    # Barge-in. Stop dispatching new text, drop the buffer,
-                    # let any in-flight job return None.
-                    cancel_event.set()
-                    text_buffer = ""
+                    # Barge-in. The reader already tripped the live events so
+                    # the worker can see them before this line runs. Clear the
+                    # tail again in case text was appended before this message
+                    # was dequeued.
+                    flags.cancel.set()
+                    flags.stop.set()
+                    held[0] = ""
 
                 elif msg_type == "ping":
                     await ws.send_text(json.dumps({"type": "pong"}))
@@ -727,26 +973,16 @@ def create_app(
                         "data": {"message": f"unknown type: {msg_type}", "code": "invalid_type"},
                     }))
 
-        except WebSocketDisconnect:
-            logger.info("[%s] disconnected", request_id)
-        except json.JSONDecodeError as e:
-            try:
-                await ws.send_text(json.dumps({
-                    "type": "error",
-                    "data": {"message": f"invalid JSON: {e}", "code": "parse_error"},
-                }))
-            except Exception:
-                pass
-        except Exception as e:
-            logger.exception("[%s] handler error", request_id)
-            try:
-                await ws.send_text(json.dumps({
-                    "type": "error",
-                    "data": {"message": str(e), "code": "internal_error"},
-                }))
-            except Exception:
-                pass
         finally:
+            # Hangup or a normal close. Stop an in-flight decode. This does
+            # not hide a synthesis error; that was already sent or raised.
+            flags.cancel.set()
+            flags.stop.set()
+            reader.cancel()
+            try:
+                await reader
+            except (asyncio.CancelledError, Exception):
+                pass
             worker._active_connections -= 1
 
     return app

@@ -21,7 +21,7 @@ Languages handled:
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import Callable, Optional
 
 import inflect
 
@@ -201,3 +201,108 @@ def split_sentences(text: str, *, max_words: int = 25) -> list[str]:
         else:
             out.append(p)
     return out
+
+
+# pocket-tts warns "Chunk has N tokens (max 50)" and can skip words past that.
+# Its splitter does not treat । as a sentence end, and the comma in "word, word"
+# is a different sentencepiece id from the comma it searches for. A 25-word
+# window of this Hindi is already over 50 tokens, so chunks stay shorter.
+POCKET_MAX_TOKENS = 50
+POCKET_SAFE_MAX_WORDS = 20
+
+# U+0964 DEVANAGARI DANDA, U+0965 DEVANAGARI DOUBLE DANDA.
+# Both are already in SENTENCE_TERMINATORS; this is the short-text trigger.
+_INDIC_FULL_STOPS = "\u0964\u0965"
+_INDIC_SPLIT_RE = re.compile(rf"(?<=[{_INDIC_FULL_STOPS}])\s+")
+
+
+def _group_words(text: str, max_words: int) -> list[str]:
+    words = text.split()
+    if len(words) <= max_words:
+        return [text] if is_speakable(text) else []
+    return [
+        " ".join(words[i : i + max_words])
+        for i in range(0, len(words), max_words)
+    ]
+
+
+def split_for_generation(
+    text: str, *, max_words: int = POCKET_SAFE_MAX_WORDS
+) -> list[str]:
+    """Split one spoken span so Pocket is not handed a 50-token overrun.
+
+    Short spans are returned unchanged, spaces included, so a pause split
+    that left ``"Hello. "`` stays ``"Hello. "``. A danda with more text
+    after it is a boundary even when the line is short. Anything still
+    over ``max_words`` is split on ``, ; :`` and then on spaces.
+    """
+
+    if not is_speakable(text):
+        return []
+    long = len(text.split()) > max_words
+    if not long and _INDIC_SPLIT_RE.search(text) is None:
+        return [text]
+
+    out: list[str] = []
+    for piece in split_sentences(text, max_words=max_words):
+        if len(piece.split()) > max_words:
+            out.extend(_group_words(piece, max_words))
+        elif is_speakable(piece):
+            out.append(piece)
+    return out or [text]
+
+
+def _bisect_to_tokens(
+    text: str,
+    token_len: Callable[[str], int],
+    max_tokens: int,
+) -> list[str]:
+    """Halve on spaces, then on characters, until each piece fits."""
+
+    if token_len(text) <= max_tokens:
+        return [text]
+    words = text.split()
+    if len(words) >= 2:
+        mid = len(words) // 2
+        parts = [" ".join(words[:mid]), " ".join(words[mid:])]
+    elif len(text) >= 2:
+        mid = len(text) // 2
+        parts = [text[:mid], text[mid:]]
+    else:
+        return [text]
+
+    out: list[str] = []
+    for part in parts:
+        if not part.strip():
+            continue
+        if token_len(part) <= max_tokens:
+            out.append(part)
+        else:
+            out.extend(_bisect_to_tokens(part, token_len, max_tokens))
+    return out or [text]
+
+
+def fit_pocket_text(
+    text: str,
+    token_len: Optional[Callable[[str], int]] = None,
+    *,
+    max_tokens: int = POCKET_MAX_TOKENS,
+    max_words: int = POCKET_SAFE_MAX_WORDS,
+) -> list[str]:
+    """Punctuation split, then the loaded Pocket tokenizer if a piece is still over.
+
+    ``token_len`` is optional so tests can run without model weights. When
+    the engine passes the tokenizer it already loaded, a piece the word cap
+    left too long is cut until it is at or under ``max_tokens``.
+    """
+
+    pieces = split_for_generation(text, max_words=max_words)
+    if token_len is None:
+        return pieces
+    fitted: list[str] = []
+    for piece in pieces:
+        if token_len(piece) <= max_tokens:
+            fitted.append(piece)
+        else:
+            fitted.extend(_bisect_to_tokens(piece, token_len, max_tokens))
+    return fitted

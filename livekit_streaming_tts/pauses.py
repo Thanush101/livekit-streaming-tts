@@ -154,7 +154,11 @@ def speech_plan(
 
     With ``pauses`` true, markers are split off before normalization. The
     normalizer sees only spoken spans, never ``[pause:1.5]`` or ``<break>``.
+    Each spoken span is then split on danda and, when it is long, on commas,
+    so one ``generate`` call is not the entire paragraph.
     """
+
+    from .normalize import split_for_generation
 
     if normalize_fn is None or speakable is None:
         from .normalize import is_speakable, normalize_text
@@ -166,7 +170,7 @@ def speech_plan(
 
     if not pauses:
         spoken = normalize_fn(text, language=language) if normalize else text
-        return [spoken] if speakable(spoken) else []
+        return split_for_generation(spoken) if speakable(spoken) else []
 
     planned: list[SpeechPart] = []
     for part in split_on_pauses(text):
@@ -175,5 +179,5 @@ def speech_plan(
             continue
         spoken = normalize_fn(part, language=language) if normalize else part
         if speakable(spoken):
-            planned.append(spoken)
+            planned.extend(split_for_generation(spoken))
     return planned

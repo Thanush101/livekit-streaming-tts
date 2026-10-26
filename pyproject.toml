@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "livekit-streaming-tts"
-version = "0.1.2"
+version = "0.1.3"
 description = "Engine-agnostic, low-latency TTS plugin for LiveKit agents. Pluggable backends: OmniVoice, Pocket TTS, Kokoro, KittenTTS, XTTS, Piper, Bark."
 readme = "README.md"
 requires-python = ">=3.10"

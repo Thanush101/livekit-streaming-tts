@@ -48,6 +48,14 @@ def main() -> None:
         "--voice-cache-max", type=int, default=64,
         help="Max cloned voices kept hot in LRU (default: 64).",
     )
+    parser.add_argument(
+        "--device",
+        default=None,
+        help=(
+            "Pocket TTS device: cpu (default) or cuda. gpu is an alias of cuda. "
+            "Env POCKET_TTS_DEVICE. Does not auto-select a GPU. Ignored by other engines."
+        ),
+    )
     args = parser.parse_args()
 
     try:
@@ -63,8 +71,21 @@ def main() -> None:
     # has heavy deps.
     from .server import create_app
 
+    chosen = (args.engine or os.getenv("TTS_ENGINE") or "kitten").lower()
+    engine_kwargs: dict = {}
+    if args.device is not None or chosen == "pocket":
+        from .engines.pocket import resolve_pocket_device
+
+        try:
+            device = resolve_pocket_device(args.device)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if chosen == "pocket":
+            engine_kwargs["device"] = device
+
     app = create_app(
         engine_name=args.engine,
+        engine_kwargs=engine_kwargs,
         max_queue_size=args.max_queue_size,
         voice_cache_max=args.voice_cache_max,
     )

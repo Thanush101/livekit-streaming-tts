@@ -28,8 +28,9 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import threading
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 import numpy as np
 
@@ -37,6 +38,8 @@ from ..base import AudioChunk, EngineCapabilities, GenerationParams, TTSEngine
 from .pocket_voice import VoiceStateCache
 
 logger = logging.getLogger("livekit_streaming_tts.pocket")
+
+_DEVICE_ENV = "POCKET_TTS_DEVICE"
 
 # Paths inside a Pocket yaml that are files on disk (or hf:// / http URLs).
 _ASSET_KEYS = (
@@ -170,6 +173,57 @@ def _materialize_config(config_path: Path) -> str:
     return str(dest)
 
 
+def resolve_pocket_device(value: Optional[str] = None) -> str:
+    """``cpu`` unless the caller asks for ``cuda``.
+
+    ``gpu`` is an alias of ``cuda``. An unset value stays on CPU. This does
+    not look for a GPU, so a machine already running another model is not
+    moved onto it.
+    """
+
+    if value is None:
+        value = os.getenv(_DEVICE_ENV, "cpu")
+    raw = value.strip().lower()
+    if raw in {"", "cpu"}:
+        return "cpu"
+    if raw in {"cuda", "gpu"}:
+        return "cuda"
+    raise ValueError(
+        "Pocket device must be cpu or cuda (gpu is an alias of cuda), "
+        f"got {value!r}"
+    )
+
+
+def _to_float32(audio) -> np.ndarray:
+    """1-D float32 samples. No trim and no int8 quantization."""
+
+    if hasattr(audio, "cpu"):
+        audio = audio.cpu().numpy()
+    else:
+        audio = np.asarray(audio)
+    return np.asarray(audio, dtype=np.float32).reshape(-1)
+
+
+def iter_pocket_pcm(model, state, pieces: list[str], stop: Optional[threading.Event] = None):
+    """Yield each ``generate_audio_stream`` chunk for ``pieces``.
+
+    ``generate_audio`` is ``torch.cat`` of that same stream, with
+    ``copy_state=True`` and the library's default frame count. Concatenating
+    these arrays is that tensor, including the first sample of each chunk.
+    ``stop`` is passed through so a barge-in can end the library iterator.
+    This generator keeps pulling until the library returns, so its decoder
+    thread joins before the next utterance uses the model.
+    """
+
+    for piece in pieces:
+        stream = model.generate_audio_stream(state, piece, copy_state=True, stop=stop)
+        for chunk in stream:
+            samples = _to_float32(chunk)
+            if samples.size == 0:
+                continue
+            yield samples
+
+
 def resolve_pocket_config() -> Optional[str]:
     """Local yaml for TTSModel.load_model, or None for the Kyutai default.
 
@@ -193,7 +247,7 @@ class PocketEngine(TTSEngine):
     native_sample_rate = 24000  # overridden in __init__ from the model
     capabilities = EngineCapabilities(
         voice_cloning=True,
-        streaming_generation=False,
+        streaming_generation=True,
         multilingual=False,
         speed_control=False,
     )
@@ -202,9 +256,13 @@ class PocketEngine(TTSEngine):
         self,
         cache_dir: Optional[str] = None,
         prewarm_voices: Optional[list[str]] = None,
+        device: Optional[str] = None,
     ) -> None:
         from pocket_tts import TTSModel
 
+        # cpu unless --device or POCKET_TTS_DEVICE says cuda. Never auto-pick.
+        # load_model() leaves weights on CPU and does not quantize them.
+        device_name = resolve_pocket_device(device)
         # Unset env keeps Kyutai English (TTSModel.load_model() with no args).
         # A community repo id is not a load_model() argument in pocket-tts 2.x.
         config_path = resolve_pocket_config()
@@ -213,6 +271,10 @@ class PocketEngine(TTSEngine):
             self._model = TTSModel.load_model(config=config_path)
         else:
             self._model = TTSModel.load_model()
+        # Same call the pocket-tts CLI makes after load_model().
+        self._model.to(device_name)
+        self.device = device_name
+        logger.info("Pocket TTS device: %s", device_name)
         # The model exposes its native rate after load.
         self.native_sample_rate = int(self._model.sample_rate)
         # In-memory voice states, plus a safetensors export so a restart
@@ -258,20 +320,86 @@ class PocketEngine(TTSEngine):
     def list_voices(self) -> list[str]:
         return self._voices.keys()
 
-    def generate(self, params: GenerationParams) -> AudioChunk:
-        # Pocket TTS requires a voice state. Presets, wav paths, hf:// wavs,
-        # and .safetensors tensors share one cache. `text` must already be a
-        # spoken span: pause markers are removed before this runs, because
-        # prepare_text_prompt would read them aloud.
+    def _token_len(self):
+        """Token counter for the model already in memory, or None.
+
+        Reading the conditioner tokenizer does not load weights. A fake model
+        in tests has no ``flow_lm`` and keeps the word splitter only.
+        """
+
+        try:
+            encode = self._model.flow_lm.conditioner.tokenizer.encode
+        except Exception:
+            return None
+
+        def token_len(text: str) -> int:
+            ids = encode(text)
+            if hasattr(ids, "shape"):
+                return int(ids.shape[-1])
+            return len(ids)
+
+        return token_len
+
+    def _spoken_pieces(self, params: GenerationParams) -> tuple[object, list[str]]:
+        """Voice state and the spans ``generate_audio`` will see.
+
+        Pause markers are already gone. The library splitter can leave a
+        Hindi line as one chunk over its 50-token limit (it then warns and
+        may skip words), so fit first. The same pieces feed ``generate`` and
+        ``generate_stream``.
+        """
+
+        from ..normalize import POCKET_MAX_TOKENS, fit_pocket_text
+
         state = self._voices.state_for_generation(params.voice, params.ref_audio)
-        audio = self._model.generate_audio(state, params.text, copy_state=True)
-        # Pocket returns a 1-D torch tensor of PCM samples.
-        if hasattr(audio, "cpu"):
-            audio = audio.cpu().numpy()
-        else:
-            audio = np.asarray(audio)
+        pieces = fit_pocket_text(params.text, self._token_len(), max_tokens=POCKET_MAX_TOKENS)
+        if len(pieces) > 1:
+            logger.info("splitting pocket text into %d chunks", len(pieces))
+        return state, pieces
+
+    def generate(self, params: GenerationParams) -> AudioChunk:
+        # One clip. HTTP /v1/tts uses this and returns one body.
+        # generate_audio collects generate_audio_stream internally.
+        state, pieces = self._spoken_pieces(params)
+        if not pieces:
+            return AudioChunk(
+                samples=np.zeros(0, dtype=np.float32),
+                sample_rate=self.native_sample_rate,
+                is_final=True,
+            )
+
+        arrays = []
+        for piece in pieces:
+            audio = self._model.generate_audio(state, piece, copy_state=True)
+            arrays.append(_to_float32(audio))
+        samples = arrays[0] if len(arrays) == 1 else np.concatenate(arrays)
         return AudioChunk(
-            samples=audio.astype(np.float32),
+            samples=samples,
             sample_rate=self.native_sample_rate,
             is_final=True,
         )
+
+    def generate_stream(
+        self,
+        params: GenerationParams,
+        stop: Optional[threading.Event] = None,
+    ) -> Iterator[AudioChunk]:
+        """Yield each decoded chunk. The websocket sends these as PCM.
+
+        Samples match ``generate`` / ``generate_audio`` aside from packet
+        boundaries. The first sample of the first chunk is included.
+        Chunks are yielded as the library produces them, so ``is_final`` is
+        left false. Holding the last chunk to mark it would also hold the
+        first chunk until the next one exists. The protocol ``final`` event
+        is sent when the client flushes, not from this flag.
+        """
+
+        state, pieces = self._spoken_pieces(params)
+        # Yield the chunk that just decoded. Do not wait for the next one:
+        # that wait is the whole TTFB when the server used generate().
+        for samples in iter_pocket_pcm(self._model, state, pieces, stop=stop):
+            yield AudioChunk(
+                samples=samples,
+                sample_rate=self.native_sample_rate,
+                is_final=False,
+            )

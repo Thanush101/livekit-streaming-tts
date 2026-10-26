@@ -15,7 +15,7 @@ Most LiveKit TTS plugins are tightly coupled to one provider. Change the model a
 | Engine     | Voice cloning  | Streaming gen | Multilingual | Speed | Footprint    | PyPI dep                |
 |------------|----------------|---------------|--------------|-------|--------------|-------------------------|
 | OmniVoice  | yes            | no            | yes          | yes   | GPU, ~3GB    | `omnivoice`             |
-| Pocket TTS | yes (kvcache)  | no            | en           | no    | GPU, ~1GB    | `pocket-tts`            |
+| Pocket TTS | yes (kvcache)  | yes           | en           | no    | CPU or GPU, ~1GB | `pocket-tts`         |
 | Kokoro     | no (presets)   | no            | en/ja/zh     | yes   | GPU, ~330MB  | `kokoro`                |
 | KittenTTS  | no (presets)   | no            | en           | no    | CPU, ~50MB   | `kittentts` + `espeak`  |
 | XTTS v2    | yes (zero-shot)| yes           | 16 langs     | yes   | GPU, ~2GB    | `TTS`                   |
@@ -104,6 +104,17 @@ tts-server --engine pocket --port 8001
 tts-server --engine omnivoice --port 8001
 tts-server --engine kitten --port 8001
 ```
+
+Pocket stays on CPU unless you opt in. `--device` and `POCKET_TTS_DEVICE` accept `cpu` (the default) or `cuda`. `gpu` is an alias of `cuda`. The server does not look for a GPU, so a box that is already running OmniVoice or vLLM stays on CPU until you pass `cuda`. `load_model()` still loads on CPU; the server then calls `model.to(device)` and logs the device once. Weights are not quantized.
+
+```bash
+tts-server --engine pocket --device cpu --port 8001
+POCKET_TTS_DEVICE=cpu tts-server --engine pocket --port 8001
+tts-server --engine pocket --device cuda --port 8001
+POCKET_TTS_DEVICE=cuda tts-server --engine pocket --port 8001
+```
+
+On the websocket, Pocket sends int16 mono PCM at the model rate as each decoded chunk is ready, then a `final` event. `POST /v1/tts` still returns one clip.
 
 Or via env var:
 
@@ -372,7 +383,7 @@ normalize_text (numbers, money, units, MD)     ← server side, off the GPU thre
 GPUWorker queue (serialized engine access)     ← server side
     │
     ▼
-TTSEngine.generate(params)                     ← swappable backend
+TTSEngine.generate_stream (Pocket websocket)   ← one-shot generate for POST /v1/tts
     │
     ▼
 np.clip + int16 + (optional) resample          ← server side
