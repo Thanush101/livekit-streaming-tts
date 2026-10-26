@@ -35,6 +35,8 @@ import logging
 import os
 import time
 import uuid
+
+import numpy as np
 from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -44,9 +46,10 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, W
 from pydantic import BaseModel
 
 from ._paths import data_dir
-from .audio import encode
-from .base import GenerationParams, TTSEngine
+from .audio import encode, resample
+from .base import AudioChunk, GenerationParams, TTSEngine
 from .normalize import is_speakable, normalize_text, split_sentences
+from .pauses import silence_samples, speech_plan
 from .registry import load_engine
 
 logger = logging.getLogger("livekit_streaming_tts.server")
@@ -212,8 +215,36 @@ class TTSRequest(BaseModel):
     seed: Optional[int] = None
     sample_rate: Optional[int] = None
     normalize: bool = True
+    pauses: bool = False
     format: str = "wav"  # "wav" or "pcm"
     extra: dict = {}
+
+
+def _as_bool(value: object, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on"}:
+            return True
+        if lowered in {"0", "false", "no", "off", ""}:
+            return False
+    return default
+
+
+def _plan_text(text: str, *, pauses: bool, normalize: bool, language: Optional[str]) -> list:
+    """Spoken spans and silence seconds. Markers are split off before normalize."""
+
+    return speech_plan(
+        text,
+        pauses=pauses,
+        normalize=normalize,
+        language=language,
+        normalize_fn=normalize_text,
+        speakable=is_speakable,
+    )
 
 
 def create_app(
@@ -352,33 +383,56 @@ def create_app(
     @app.post("/v1/tts")
     async def http_tts(req: TTSRequest):
         worker = _worker()
-        text = normalize_text(req.text, language=req.language) if req.normalize else req.text
-        if not is_speakable(text):
-            return {"audio": "", "sample_rate": req.sample_rate or 0, "format": req.format}
-
-        params = GenerationParams(
-            text=text,
-            voice=req.voice,
-            ref_audio=req.ref_audio,
-            ref_text=req.ref_text,
-            language=req.language,
-            speed=req.speed,
-            seed=req.seed,
-            sample_rate=req.sample_rate,
-            extra=req.extra,
-        )
-        job = _Job(params=params, cancel_event=asyncio.Event())
         try:
-            audio = await worker.submit(job)
-        except asyncio.QueueFull:
-            raise HTTPException(status_code=503, detail="server overloaded")
-
-        if audio is None:
+            plan = _plan_text(
+                req.text,
+                pauses=req.pauses,
+                normalize=req.normalize,
+                language=req.language,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if not plan:
             return {"audio": "", "sample_rate": req.sample_rate or 0, "format": req.format}
 
+        native = worker.engine.native_sample_rate
+        pieces: list[np.ndarray] = []
+        for part in plan:
+            if isinstance(part, float):
+                samples = silence_samples(part, native)
+                if samples.size:
+                    pieces.append(samples)
+                continue
+            params = GenerationParams(
+                text=part,
+                voice=req.voice,
+                ref_audio=req.ref_audio,
+                ref_text=req.ref_text,
+                language=req.language,
+                speed=req.speed,
+                seed=req.seed,
+                sample_rate=req.sample_rate,
+                extra=req.extra,
+            )
+            job = _Job(params=params, cancel_event=asyncio.Event())
+            try:
+                audio = await worker.submit(job)
+            except asyncio.QueueFull:
+                raise HTTPException(status_code=503, detail="server overloaded")
+            if audio is None or getattr(audio.samples, "size", 0) == 0:
+                continue
+            chunk = np.asarray(audio.samples, dtype=np.float32)
+            if audio.sample_rate != native:
+                chunk = resample(chunk, audio.sample_rate, native)
+            pieces.append(chunk)
+
+        if not pieces:
+            return {"audio": "", "sample_rate": req.sample_rate or 0, "format": req.format}
+
+        mixed = pieces[0] if len(pieces) == 1 else np.concatenate(pieces)
         encoded, sr = encode(
-            audio.samples,
-            src_sample_rate=audio.sample_rate,
+            mixed,
+            src_sample_rate=native,
             target_sample_rate=req.sample_rate,
             format=req.format,
         )
@@ -426,6 +480,7 @@ def create_app(
             "seed": None,
             "sample_rate": worker.engine.native_sample_rate,
             "normalize": True,
+            "pauses": False,      # splice [pause] / <break> as exact zeros
             "format": "wav",      # "wav" or "pcm"
             "binary": False,      # if True + format=pcm, send PCM as binary frames
             "extra": {},
@@ -464,30 +519,56 @@ def create_app(
 
         async def _generate_and_send(text: str):
             nonlocal cancel_event
-            # Normalize on the WS handler thread, NOT in the GPU worker.
-            text = normalize_text(text, language=config["language"]) if config["normalize"] else text
-            if not is_speakable(text):
-                return
-
-            params = GenerationParams(
-                text=text,
-                voice=config["voice"],
-                language=config["language"],
-                speed=config["speed"],
-                seed=config["seed"],
-                sample_rate=config["sample_rate"],
-                extra=config["extra"],
-            )
-            job = _Job(params=params, cancel_event=cancel_event)
+            # Pause markers are split off before normalize. With pauses off,
+            # the text is left as-is (still normalized when that flag is on)
+            # and no silence is inserted.
             try:
-                audio = await worker.submit(job)
-            except asyncio.QueueFull:
+                plan = _plan_text(
+                    text,
+                    pauses=bool(config["pauses"]),
+                    normalize=bool(config["normalize"]),
+                    language=config["language"],
+                )
+            except ValueError as exc:
                 await ws.send_text(json.dumps({
                     "type": "error",
-                    "data": {"message": "queue full", "code": "queue_full"},
+                    "data": {"message": str(exc), "code": "invalid_text"},
                 }))
                 return
-            await _send_audio(audio, config["sample_rate"])
+
+            native = worker.engine.native_sample_rate
+            for part in plan:
+                if cancel_event.is_set():
+                    return
+                if isinstance(part, float):
+                    samples = silence_samples(part, native)
+                    if samples.size == 0:
+                        continue
+                    await _send_audio(
+                        AudioChunk(samples=samples, sample_rate=native, is_final=True),
+                        config["sample_rate"],
+                    )
+                    continue
+
+                params = GenerationParams(
+                    text=part,
+                    voice=config["voice"],
+                    language=config["language"],
+                    speed=config["speed"],
+                    seed=config["seed"],
+                    sample_rate=config["sample_rate"],
+                    extra=config["extra"],
+                )
+                job = _Job(params=params, cancel_event=cancel_event)
+                try:
+                    audio = await worker.submit(job)
+                except asyncio.QueueFull:
+                    await ws.send_text(json.dumps({
+                        "type": "error",
+                        "data": {"message": "queue full", "code": "queue_full"},
+                    }))
+                    return
+                await _send_audio(audio, config["sample_rate"])
 
         try:
             while True:
@@ -497,9 +578,15 @@ def create_app(
 
                 if msg_type == "config":
                     data = msg.get("data", {})
+                    if not isinstance(data, dict):
+                        data = {}
                     for key in config:
+                        if key == "pauses":
+                            continue
                         if key in data:
                             config[key] = data[key]
+                    if "pauses" in data:
+                        config["pauses"] = _as_bool(data["pauses"])
                     # Validate sample_rate range — common telephony rates
                     # are 8000/16000; max sensible is the engine's native.
                     sr = config["sample_rate"]

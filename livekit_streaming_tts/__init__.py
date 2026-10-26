@@ -9,9 +9,23 @@ Public API:
 """
 
 from .base import TTSEngine, GenerationParams, AudioChunk, EngineCapabilities
-from .plugin import StreamingTTS
-from .server import create_app
 from .registry import load_engine, register_engine, available_engines
+
+# The LiveKit client and the FastAPI app pull optional deps (livekit-agents,
+# fastapi). Load them on first use so importing an engine does not require either.
+
+
+def __getattr__(name: str):
+    if name == "StreamingTTS":
+        from .plugin import StreamingTTS
+
+        return StreamingTTS
+    if name == "create_app":
+        from .server import create_app
+
+        return create_app
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "TTSEngine",

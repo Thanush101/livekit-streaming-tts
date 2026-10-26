@@ -124,6 +124,49 @@ curl http://localhost:8001/health
 # {"status":"ok","engine":"pocket","capabilities":{...},"voices":[...]}
 ```
 
+## Community models
+
+With no extra env, `tts-server --engine pocket` loads Kyutai's English Pocket TTS. That is the model in the table above.
+
+[Thanushttk/pocket-tts-multilingual](https://huggingface.co/Thanushttk/pocket-tts-multilingual) is a community finetune, not an official Kyutai release. It speaks English, Hindi, Marathi, Kannada, Tamil, Malayalam, and Telugu at 24 kHz, about 418 MB, and it is meant to run on CPU. Guidance is already baked in. Bengali, Gujarati, Odia, and Punjabi are not supported.
+
+pocket-tts 2.x takes a bundled language name (`english`, `french_24l`, ...) or a local `.yaml` in `TTSModel.load_model`. A Hub repo id and an `hf://` config path both fail on 2.1.0. On that Hub card, `weights_path` and `tokenizer_path` are relative (`model.safetensors`, `tokenizer.model`), and the library opens them from the process working directory. The folder that holds the yaml is not searched.
+
+Point the server at the repo. It downloads the snapshot into the Hugging Face cache, rewrites those relative paths to absolute paths, and loads that yaml:
+
+```bash
+POCKET_TTS_MODEL=Thanushttk/pocket-tts-multilingual tts-server --engine pocket --port 8001
+```
+
+`POCKET_TTS_MODEL` is an `owner/name` repo id. The server leaves temperature and decode steps at the library defaults: this yaml's `default_temperature` is 0.3, and pocket-tts uses 1 decode step.
+
+A yaml you already have, or the same file on the Hub:
+
+```bash
+POCKET_TTS_CONFIG=/path/to/config.yaml tts-server --engine pocket --port 8001
+POCKET_TTS_CONFIG=hf://Thanushttk/pocket-tts-multilingual/config.yaml tts-server --engine pocket --port 8001
+```
+
+Set only one of the two. Leave both unset to keep the Kyutai English model.
+
+`voice="alba"` still works. Preset names are embeddings that ship with Kyutai's bundled language configs, so on a community model the server clones [alba's wav](https://huggingface.co/kyutai/tts-voices/blob/main/alba-mackenna/casual.wav) (`hf://kyutai/tts-voices/alba-mackenna/casual.wav`) instead. A local wav, another `hf://` voice URL, or a clip posted to `/v1/voices/upload` works the same way.
+
+The model is process-level. A websocket connection cannot swap weights, and the Pocket client does not send a model id. Reloading the checkpoint on every turn is not supported.
+
+### Voice tensors
+
+Encoding a reference wav into a voice state is the slow step. The server keeps that state in memory, keyed by the voice string (preset, path, `hf://` URL, or upload id). Later utterances pass the same object to `generate_audio` with `copy_state=True`. The library copies the KV cache for that utterance so the cached state is not mutated. That copy is not another wav encode.
+
+The first encode is also written under `POCKET_TTS_CACHE_DIR` (default `~/.local/share/livekit-streaming-tts/pocket-cache`) as a `.safetensors` file. The next server start loads that file. It does not encode the wav again.
+
+`voice` on a connection can be:
+
+- a preset: `alba`
+- a wav path the server can read, or `hf://kyutai/tts-voices/alba-mackenna/casual.wav`
+- a `.safetensors` voice state from this cache (or any file `get_state_for_audio_prompt` can import)
+
+pocket-tts 2.1.0 does not load a `.pt` voice file. The first call for a new wav pays the clone cost. After that, including after a restart, the server loads the tensor. The client sends the voice string once per websocket, not the wav bytes on every text frame.
+
 ## Connect from the client
 
 Two supported clients.
@@ -179,7 +222,7 @@ This single block works for **every** engine the server supports. Switching from
 
 | Engine     | Built-in voice names                              | Custom voices?                                  |
 |------------|---------------------------------------------------|-------------------------------------------------|
-| Pocket TTS | `alba` (default), plus any HuggingFace voice URL  | yes, via `/v1/voices/upload` or `hf://...` URL  |
+| Pocket TTS | `alba` (default), a server wav path, an `hf://` wav, or a `.safetensors` voice state | yes; the first clone is cached |
 | OmniVoice  | none built-in                                     | yes, via `/v1/voices/upload` (always required)  |
 | Kokoro     | `af_heart`, `af_bella`, `am_adam`, `bf_emma`, ... | no (preset list only)                           |
 | KittenTTS  | `expr-voice-2-f`, `expr-voice-2-m`, ...           | no (preset list only)                           |
@@ -242,7 +285,22 @@ curl -F "file=@my-voice.wav" \
 
 Then pass `voice="alice"` to `StreamingTTS`. The server caches the prompt and subsequent generations are fast.
 
-Pocket TTS bonus: voice prompts are exported to safetensors (kvcache). On restart the server reloads voices from disk in milliseconds instead of recomputing.
+Pocket TTS writes a `.safetensors` voice state the first time it clones that upload. A restart loads the tensor instead of encoding the wav again. You can also pass that file as `voice`.
+
+## Pauses
+
+Off unless the client sends `pauses: true` (the Pocket plugin argument is `pauses=True`). pocket-tts 2.1.0 has no pause API. With the flag off, the server does not insert silence and does not parse markers.
+
+With the flag on, the server splits the text before normalization. Spoken pieces go through the model. Durations become exact zeros at the model sample rate (24 kHz for Pocket), so a 24 kHz client receives that many zero samples. Markers are not spoken.
+
+| Text | Silence |
+| --- | --- |
+| `[pause]` or `<break/>` | 0.5s |
+| `[pause:1.5]` or `<break time="1.5s"/>` | 1.5s |
+| `<break time="500ms"/>` | 0.5s |
+| `<break strength="weak"/>` | 0.25s |
+
+Durations clamp to 10 seconds. If a break tag sets both `time` and `strength`, `time` wins. A `<speak>` wrapper is stripped. Any other SSML tag is an error. The LLM has to emit the marker literally between sentences, for example `Hello. [pause:0.5] World.`
 
 ## Adding a new engine
 
